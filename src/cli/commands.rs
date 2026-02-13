@@ -73,20 +73,20 @@ pub enum Commands {
 
     /// Show task details
     Show {
-        /// Task ID
-        id: u64,
+        /// Task ID (or project:id for qualified ID)
+        id: String,
     },
 
     /// Mark task(s) as completed
     Complete {
-        /// Task ID(s)
-        ids: Vec<u64>,
+        /// Task ID(s) (or project:id for qualified IDs)
+        ids: Vec<String>,
     },
 
     /// Change task status
     Status {
-        /// Task ID
-        id: u64,
+        /// Task ID (or project:id for qualified ID)
+        id: String,
 
         /// New status (pending, in-progress, completed, archived)
         #[arg(value_parser = parse_status)]
@@ -95,8 +95,8 @@ pub enum Commands {
 
     /// Update task properties
     Update {
-        /// Task ID
-        id: u64,
+        /// Task ID (or project:id for qualified ID)
+        id: String,
 
         /// New title
         #[arg(long)]
@@ -121,8 +121,8 @@ pub enum Commands {
 
     /// Delete a task
     Delete {
-        /// Task ID
-        id: u64,
+        /// Task ID (or project:id for qualified ID)
+        id: String,
 
         /// Skip confirmation
         #[arg(short, long)]
@@ -131,6 +131,21 @@ pub enum Commands {
 
     /// Show task statistics
     Stats,
+
+    /// Register a project for global aggregation
+    Link {
+        /// Project path (defaults to current directory)
+        path: Option<std::path::PathBuf>,
+    },
+
+    /// Unregister a project from global aggregation
+    Unlink {
+        /// Project path (defaults to current directory)
+        path: Option<std::path::PathBuf>,
+    },
+
+    /// List registered projects
+    Projects,
 }
 
 fn parse_kind(s: &str) -> Result<TaskKind, String> {

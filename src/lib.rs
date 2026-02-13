@@ -10,4 +10,4 @@ pub mod models;
 pub mod storage;
 
 pub use models::{Priority, Task, TaskKind, TaskStatus};
-pub use storage::{FileStore, TaskFilter, TaskLocation, TaskStats};
+pub use storage::{FileStore, ProjectRegistry, ProjectStatus, TaskFilter, TaskLocation, TaskStats};

@@ -5,7 +5,10 @@
 
 use crate::git::GitOperations;
 use crate::models::{Task, TaskKind, TaskStatus};
-use crate::storage::{FileStore, TaskFilter, TaskLocation};
+use crate::storage::{
+    AggregatedTask, FileStore, ProjectRegistry, TaskFilter, TaskLocation, list_aggregated,
+    resolve_qualified_id,
+};
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -100,6 +103,54 @@ impl From<&Task> for TaskOutput {
     }
 }
 
+/// Aggregated task output for MCP responses (includes project)
+#[derive(Serialize)]
+struct AggregatedTaskOutput {
+    /// Qualified ID (project:id)
+    id: String,
+    project: String,
+    title: String,
+    kind: String,
+    status: String,
+    priority: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    due: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    closed_commit: Option<String>,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    description: String,
+}
+
+impl From<&AggregatedTask> for AggregatedTaskOutput {
+    fn from(agg: &AggregatedTask) -> Self {
+        AggregatedTaskOutput {
+            id: agg.qualified_id(),
+            project: agg.project.clone(),
+            title: agg.task.title.clone(),
+            kind: agg.task.kind.to_string(),
+            status: agg.task.status.to_string(),
+            priority: agg.task.priority.to_string(),
+            tags: agg.task.tags.clone(),
+            due: agg.task.due.map(|d| d.to_string()),
+            closed_commit: agg.task.closed_commit.clone(),
+            description: agg.task.description.clone(),
+        }
+    }
+}
+
+/// Project output for MCP responses
+#[derive(Serialize)]
+struct ProjectOutput {
+    name: String,
+    path: String,
+    exists: bool,
+    has_tasks_dir: bool,
+    open_tasks: usize,
+    total_tasks: usize,
+}
+
 /// MCP Server state
 pub struct McpServer {
     global: bool,
@@ -117,6 +168,33 @@ impl McpServer {
             TaskLocation::find_project().map_err(|e| e.to_string())?
         };
         Ok(FileStore::new(location))
+    }
+
+    /// Resolve an ID that can be either a numeric ID or a qualified ID string
+    fn resolve_id(&self, id_value: &Value) -> Result<(FileStore, u64), String> {
+        // Try to get as u64 first (backward compatible)
+        if let Some(id) = id_value.as_u64() {
+            let store = self.get_store()?;
+            return Ok((store, id));
+        }
+
+        // Try to get as string (qualified ID support)
+        if let Some(id_str) = id_value.as_str() {
+            let registry = ProjectRegistry::load().ok();
+            let default_location = self.get_store().ok().map(|s| s.location().clone());
+
+            let (location, task_id) = resolve_qualified_id(
+                id_str,
+                registry
+                    .as_ref()
+                    .unwrap_or(&ProjectRegistry::load().map_err(|e| e.to_string())?),
+                default_location.as_ref(),
+            )?;
+
+            return Ok((FileStore::new(location), task_id));
+        }
+
+        Err("Invalid ID: expected number or string".to_string())
     }
 
     /// Handle a JSON-RPC request and return a response
@@ -179,7 +257,8 @@ impl McpServer {
                             "status": {"type": "string"},
                             "priority": {"type": "string"},
                             "tags": {"type": "array", "items": {"type": "string"}},
-                            "include_archived": {"type": "boolean"}
+                            "include_archived": {"type": "boolean"},
+                            "aggregate": {"type": "boolean", "description": "If true, aggregate tasks from all registered projects"}
                         }
                     }
                 },
@@ -251,6 +330,36 @@ impl McpServer {
                         "type": "object",
                         "properties": {}
                     }
+                },
+                {
+                    "name": "link_project",
+                    "description": "Register a project for global task aggregation",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Project path to register"}
+                        },
+                        "required": ["path"]
+                    }
+                },
+                {
+                    "name": "unlink_project",
+                    "description": "Unregister a project from global task aggregation",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "Project path to unregister"}
+                        },
+                        "required": ["path"]
+                    }
+                },
+                {
+                    "name": "list_projects",
+                    "description": "List all registered projects with their status",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
                 }
             ]
         });
@@ -276,6 +385,9 @@ impl McpServer {
             "delete_task" => self.tool_delete_task(&args),
             "set_task_status" => self.tool_set_task_status(&args),
             "get_stats" => self.tool_get_stats(&args),
+            "link_project" => self.tool_link_project(&args),
+            "unlink_project" => self.tool_unlink_project(&args),
+            "list_projects" => self.tool_list_projects(&args),
             _ => Err(format!("Unknown tool: {}", name)),
         };
 
@@ -377,6 +489,22 @@ impl McpServer {
                 .unwrap_or(false),
         };
 
+        // Check if aggregation is requested
+        let aggregate = args
+            .get("aggregate")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if aggregate {
+            let registry = ProjectRegistry::load().map_err(|e| e.to_string())?;
+            if !registry.is_empty() {
+                let tasks = list_aggregated(&registry, &filter).map_err(|e| e.to_string())?;
+                let output: Vec<AggregatedTaskOutput> =
+                    tasks.iter().map(AggregatedTaskOutput::from).collect();
+                return Ok(json!(output));
+            }
+        }
+
         let store = self.get_store()?;
         let tasks = store.list(&filter).map_err(|e| e.to_string())?;
 
@@ -385,33 +513,30 @@ impl McpServer {
     }
 
     fn tool_get_task(&self, args: &Value) -> Result<Value, String> {
-        let id = args
-            .get("id")
-            .and_then(|v| v.as_u64())
-            .ok_or("Missing 'id'")?;
+        let id_value = args.get("id").ok_or("Missing 'id'")?;
+        let (store, task_id) = self.resolve_id(id_value)?;
 
-        let store = self.get_store()?;
-        let task = store.read(id).map_err(|e| e.to_string())?;
+        let task = store.read(task_id).map_err(|e| e.to_string())?;
 
         Ok(json!(TaskOutput::from(&task)))
     }
 
     fn tool_complete_task(&self, args: &Value) -> Result<Value, String> {
-        let ids: Vec<u64> = args
+        let ids_array = args
             .get("ids")
             .and_then(|v| v.as_array())
-            .ok_or("Missing 'ids'")?
-            .iter()
-            .filter_map(|v| v.as_u64())
-            .collect();
-
-        let store = self.get_store()?;
-        let commit = GitOperations::head_commit_optional(&store.location().root);
+            .ok_or("Missing 'ids'")?;
 
         let mut completed = Vec::new();
-        for id in ids {
-            let mut task = store.read(id).map_err(|e| e.to_string())?;
-            task.complete(commit.clone());
+
+        for id_value in ids_array {
+            let (store, task_id) = self.resolve_id(id_value)?;
+
+            // Get git commit from the resolved project
+            let commit = GitOperations::head_commit_optional(&store.location().root);
+
+            let mut task = store.read(task_id).map_err(|e| e.to_string())?;
+            task.complete(commit);
             store.update(&task).map_err(|e| e.to_string())?;
             completed.push(TaskOutput::from(&task));
         }
@@ -420,13 +545,10 @@ impl McpServer {
     }
 
     fn tool_update_task(&self, args: &Value) -> Result<Value, String> {
-        let id = args
-            .get("id")
-            .and_then(|v| v.as_u64())
-            .ok_or("Missing 'id'")?;
+        let id_value = args.get("id").ok_or("Missing 'id'")?;
+        let (store, task_id) = self.resolve_id(id_value)?;
 
-        let store = self.get_store()?;
-        let mut task = store.read(id).map_err(|e| e.to_string())?;
+        let mut task = store.read(task_id).map_err(|e| e.to_string())?;
 
         if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
             task.title = title.to_string();
@@ -461,22 +583,17 @@ impl McpServer {
     }
 
     fn tool_delete_task(&self, args: &Value) -> Result<Value, String> {
-        let id = args
-            .get("id")
-            .and_then(|v| v.as_u64())
-            .ok_or("Missing 'id'")?;
+        let id_value = args.get("id").ok_or("Missing 'id'")?;
+        let (store, task_id) = self.resolve_id(id_value)?;
 
-        let store = self.get_store()?;
-        store.delete(id).map_err(|e| e.to_string())?;
+        store.delete(task_id).map_err(|e| e.to_string())?;
 
-        Ok(json!({"deleted": id}))
+        Ok(json!({"deleted": task_id}))
     }
 
     fn tool_set_task_status(&self, args: &Value) -> Result<Value, String> {
-        let id = args
-            .get("id")
-            .and_then(|v| v.as_u64())
-            .ok_or("Missing 'id'")?;
+        let id_value = args.get("id").ok_or("Missing 'id'")?;
+        let (store, task_id) = self.resolve_id(id_value)?;
 
         let status: TaskStatus = args
             .get("status")
@@ -484,10 +601,9 @@ impl McpServer {
             .ok_or("Missing 'status'")?
             .parse()?;
 
-        let store = self.get_store()?;
-        let mut task = store.read(id).map_err(|e| e.to_string())?;
+        let mut task = store.read(task_id).map_err(|e| e.to_string())?;
 
-        // If completing, capture git commit
+        // If completing, capture git commit from the resolved project
         if status == TaskStatus::Completed && task.status != TaskStatus::Completed {
             let commit = GitOperations::head_commit_optional(&store.location().root);
             task.closed_commit = commit;
@@ -517,6 +633,69 @@ impl McpServer {
                 "ideas": stats.ideas
             }
         }))
+    }
+
+    fn tool_link_project(&self, args: &Value) -> Result<Value, String> {
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'path'")?;
+
+        let path = std::path::PathBuf::from(path);
+        let mut registry = ProjectRegistry::load().map_err(|e| e.to_string())?;
+
+        let inserted = registry.link(&path).map_err(|e| e.to_string())?;
+
+        Ok(json!({
+            "path": path.to_string_lossy(),
+            "linked": inserted,
+            "message": if inserted {
+                format!("Linked project: {}", path.display())
+            } else {
+                format!("Project already linked: {}", path.display())
+            }
+        }))
+    }
+
+    fn tool_unlink_project(&self, args: &Value) -> Result<Value, String> {
+        let path = args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or("Missing 'path'")?;
+
+        let path = std::path::PathBuf::from(path);
+        let mut registry = ProjectRegistry::load().map_err(|e| e.to_string())?;
+
+        let removed = registry.unlink(&path).map_err(|e| e.to_string())?;
+
+        Ok(json!({
+            "path": path.to_string_lossy(),
+            "unlinked": removed,
+            "message": if removed {
+                format!("Unlinked project: {}", path.display())
+            } else {
+                format!("Project was not linked: {}", path.display())
+            }
+        }))
+    }
+
+    fn tool_list_projects(&self, _args: &Value) -> Result<Value, String> {
+        let registry = ProjectRegistry::load().map_err(|e| e.to_string())?;
+        let statuses = registry.project_statuses();
+
+        let output: Vec<ProjectOutput> = statuses
+            .iter()
+            .map(|s| ProjectOutput {
+                name: s.name.clone(),
+                path: s.path.to_string_lossy().to_string(),
+                exists: s.exists,
+                has_tasks_dir: s.has_tasks_dir,
+                open_tasks: s.open_tasks,
+                total_tasks: s.total_tasks,
+            })
+            .collect();
+
+        Ok(json!(output))
     }
 }
 

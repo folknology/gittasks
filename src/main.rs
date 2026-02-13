@@ -3,12 +3,15 @@
 use anyhow::Result;
 use clap::Parser;
 use gittask::cli::display::{
-    display_stats, display_task_detail, display_task_list, error, success,
+    display_aggregated_task_list, display_projects, display_stats, display_task_detail,
+    display_task_list, error, success,
 };
 use gittask::cli::{Cli, Commands};
 use gittask::git::GitOperations;
 use gittask::models::Task;
-use gittask::storage::{FileStore, TaskFilter, TaskLocation};
+use gittask::storage::{
+    FileStore, ProjectRegistry, TaskFilter, TaskLocation, list_aggregated, resolve_qualified_id,
+};
 use std::io::{self, Write};
 
 fn main() -> Result<()> {
@@ -86,7 +89,6 @@ fn run(cli: Cli) -> Result<()> {
             tags,
             include_archived,
         } => {
-            let store = FileStore::new(location);
             let filter = TaskFilter {
                 kind,
                 status,
@@ -94,39 +96,77 @@ fn run(cli: Cli) -> Result<()> {
                 tags,
                 include_archived,
             };
+
+            // If global mode and registry has projects, use aggregated view
+            if cli.global {
+                let registry = ProjectRegistry::load()?;
+                if !registry.is_empty() {
+                    let tasks = list_aggregated(&registry, &filter)?;
+                    display_aggregated_task_list(&tasks);
+                    return Ok(());
+                }
+            }
+
+            // Otherwise, use regular listing
+            let store = FileStore::new(location);
             let tasks = store.list(&filter)?;
             display_task_list(&tasks);
         }
 
         Commands::Show { id } => {
-            let store = FileStore::new(location);
-            let task = store.read(id)?;
+            let registry = ProjectRegistry::load().ok();
+            let (resolved_location, task_id) = resolve_qualified_id(
+                &id,
+                registry.as_ref().unwrap_or(&ProjectRegistry::load()?),
+                Some(&location),
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+            let store = FileStore::new(resolved_location);
+            let task = store.read(task_id)?;
             display_task_detail(&task);
         }
 
         Commands::Complete { ids } => {
-            let store = FileStore::new(location.clone());
+            let registry = ProjectRegistry::load().ok();
 
-            // Get current git commit if available
-            let commit = GitOperations::head_commit_optional(&location.root);
+            for id_str in ids {
+                let (resolved_location, task_id) = resolve_qualified_id(
+                    &id_str,
+                    registry.as_ref().unwrap_or(&ProjectRegistry::load()?),
+                    Some(&location),
+                )
+                .map_err(|e| anyhow::anyhow!(e))?;
 
-            for id in ids {
-                let mut task = store.read(id)?;
-                task.complete(commit.clone());
+                let store = FileStore::new(resolved_location.clone());
+
+                // Get current git commit from the resolved project
+                let commit = GitOperations::head_commit_optional(&resolved_location.root);
+
+                let mut task = store.read(task_id)?;
+                task.complete(commit);
                 store.update(&task)?;
                 success(&format!("Completed #{}: {}", task.id, task.title));
             }
         }
 
         Commands::Status { id, status } => {
-            let store = FileStore::new(location.clone());
-            let mut task = store.read(id)?;
+            let registry = ProjectRegistry::load().ok();
+            let (resolved_location, task_id) = resolve_qualified_id(
+                &id,
+                registry.as_ref().unwrap_or(&ProjectRegistry::load()?),
+                Some(&location),
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
 
-            // If completing, capture git commit
+            let store = FileStore::new(resolved_location.clone());
+            let mut task = store.read(task_id)?;
+
+            // If completing, capture git commit from the resolved project
             if status == gittask::TaskStatus::Completed
                 && task.status != gittask::TaskStatus::Completed
             {
-                let commit = GitOperations::head_commit_optional(&location.root);
+                let commit = GitOperations::head_commit_optional(&resolved_location.root);
                 task.closed_commit = commit;
             }
 
@@ -144,8 +184,16 @@ fn run(cli: Cli) -> Result<()> {
             due,
             tags,
         } => {
-            let store = FileStore::new(location);
-            let mut task = store.read(id)?;
+            let registry = ProjectRegistry::load().ok();
+            let (resolved_location, task_id) = resolve_qualified_id(
+                &id,
+                registry.as_ref().unwrap_or(&ProjectRegistry::load()?),
+                Some(&location),
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+            let store = FileStore::new(resolved_location);
+            let mut task = store.read(task_id)?;
 
             if let Some(t) = title {
                 task.title = t;
@@ -173,10 +221,18 @@ fn run(cli: Cli) -> Result<()> {
         }
 
         Commands::Delete { id, force } => {
-            let store = FileStore::new(location);
+            let registry = ProjectRegistry::load().ok();
+            let (resolved_location, task_id) = resolve_qualified_id(
+                &id,
+                registry.as_ref().unwrap_or(&ProjectRegistry::load()?),
+                Some(&location),
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+            let store = FileStore::new(resolved_location);
 
             if !force {
-                let task = store.read(id)?;
+                let task = store.read(task_id)?;
                 print!("Delete #{} '{}'? [y/N] ", task.id, task.title);
                 io::stdout().flush()?;
 
@@ -189,14 +245,56 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
 
-            store.delete(id)?;
-            success(&format!("Deleted #{}", id));
+            store.delete(task_id)?;
+            success(&format!("Deleted #{}", task_id));
         }
 
         Commands::Stats => {
             let store = FileStore::new(location);
             let stats = store.stats()?;
             display_stats(&stats);
+        }
+
+        Commands::Link { path } => {
+            let mut registry = ProjectRegistry::load()?;
+
+            let project_path = if let Some(p) = path {
+                p
+            } else {
+                // Default to current project root
+                location.root.clone()
+            };
+
+            let inserted = registry.link(&project_path)?;
+            if inserted {
+                success(&format!("Linked project: {}", project_path.display()));
+            } else {
+                log::info!("Project already linked: {}", project_path.display());
+            }
+        }
+
+        Commands::Unlink { path } => {
+            let mut registry = ProjectRegistry::load()?;
+
+            let project_path = if let Some(p) = path {
+                p
+            } else {
+                // Default to current project root
+                location.root.clone()
+            };
+
+            let removed = registry.unlink(&project_path)?;
+            if removed {
+                success(&format!("Unlinked project: {}", project_path.display()));
+            } else {
+                log::info!("Project was not linked: {}", project_path.display());
+            }
+        }
+
+        Commands::Projects => {
+            let registry = ProjectRegistry::load()?;
+            let statuses = registry.project_statuses();
+            display_projects(&statuses);
         }
     }
 

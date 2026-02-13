@@ -5,6 +5,7 @@ use crate::models::{
 };
 use crate::storage::id_generator::IdGenerator;
 use crate::storage::location::TaskLocation;
+use crate::storage::registry::ProjectRegistry;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -253,6 +254,121 @@ pub struct TaskStats {
     pub tasks: usize,
     pub todos: usize,
     pub ideas: usize,
+}
+
+/// A task with its project context for aggregated views
+#[derive(Debug, Clone)]
+pub struct AggregatedTask {
+    /// The task itself
+    pub task: Task,
+    /// Project name (directory name)
+    pub project: String,
+    /// Project root path
+    pub project_path: PathBuf,
+}
+
+impl AggregatedTask {
+    /// Get the qualified ID (project:id format)
+    pub fn qualified_id(&self) -> String {
+        format!("{}:{}", self.project, self.task.id)
+    }
+}
+
+/// List tasks aggregated from all registered projects
+pub fn list_aggregated(
+    registry: &ProjectRegistry,
+    filter: &TaskFilter,
+) -> Result<Vec<AggregatedTask>, FileStoreError> {
+    let mut results = Vec::new();
+
+    for project_path in registry.projects() {
+        let project_name = project_path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| project_path.to_string_lossy().to_string());
+
+        // Skip projects that don't exist
+        if !project_path.exists() {
+            log::warn!("Project path does not exist: {}", project_path.display());
+            continue;
+        }
+
+        // Try to get tasks from this project
+        match TaskLocation::find_project_from(project_path) {
+            Ok(location) => {
+                let store = FileStore::new(location.clone());
+                match store.list(filter) {
+                    Ok(tasks) => {
+                        for task in tasks {
+                            results.push(AggregatedTask {
+                                task,
+                                project: project_name.clone(),
+                                project_path: location.root.clone(),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to list tasks from {}: {}",
+                            project_path.display(),
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to find project at {}: {}",
+                    project_path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    // Sort by project name, then by task ID
+    results.sort_by(|a, b| {
+        a.project
+            .cmp(&b.project)
+            .then_with(|| a.task.id.cmp(&b.task.id))
+    });
+
+    Ok(results)
+}
+
+/// Resolve a qualified ID (e.g., "gittask:1" or just "1")
+/// Returns (project_path, task_id) if found
+pub fn resolve_qualified_id(
+    id_str: &str,
+    registry: &ProjectRegistry,
+    default_location: Option<&TaskLocation>,
+) -> Result<(TaskLocation, u64), String> {
+    if let Some((project_name, id_part)) = id_str.split_once(':') {
+        // Qualified ID: "project:id"
+        let task_id: u64 = id_part
+            .parse()
+            .map_err(|_| format!("Invalid task ID: {}", id_part))?;
+
+        let project_path = registry
+            .find_project(project_name)
+            .ok_or_else(|| format!("Project not found: {}", project_name))?;
+
+        let location = TaskLocation::find_project_from(&project_path)
+            .map_err(|e| format!("Failed to find project: {}", e))?;
+
+        Ok((location, task_id))
+    } else {
+        // Local ID: just a number
+        let task_id: u64 = id_str
+            .parse()
+            .map_err(|_| format!("Invalid task ID: {}", id_str))?;
+
+        let location = default_location
+            .cloned()
+            .ok_or_else(|| "No default location available".to_string())?;
+
+        Ok((location, task_id))
+    }
 }
 
 #[cfg(test)]
